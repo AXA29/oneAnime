@@ -1,0 +1,383 @@
+# ============================================================================
+#  oneAnime — The Forge Factory v7.2 (The Bulletproof Edition)
+# ============================================================================
+name: Forge Factory Bulletproof
+
+on:
+  push:
+    branches: [ "main", "master", "release/**" ]
+    tags: [ "v*" ]
+    paths-ignore: [ "**.md", "docs/**", ".github/ISSUE_TEMPLATE/**" ]
+  pull_request:
+    branches: [ "main", "master" ]
+    types: [ opened, synchronize, reopened ]
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "APK variant"
+        required: true
+        default: "release"
+        type: choice
+        options: [ "debug", "profile", "release" ]
+      strict_mode:
+        description: "Fail on warnings?"
+        required: true
+        default: "true"
+        type: boolean
+
+concurrency:
+  group: forge-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "17"
+  JAVA_DISTRIBUTION: "zulu"
+  FLUTTER_VERSION: "3.24.3"
+  COVERAGE_MIN_PCT: "50"
+  STRICT_MODE: ${{ github.event.inputs.strict_mode || 'true' }}
+  VARIANT: ${{ github.event_name == 'pull_request' && 'debug' || github.event.inputs.build_variant || 'release' }}
+
+jobs:
+  pre-flight:
+    name: "Pre-Flight Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build_ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: "Verify Essential Files"
+        run: |
+          set -euo pipefail
+          for file in pubspec.yaml lib/main.dart; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing required file: $file"
+              exit 1
+            fi
+          done
+          echo "Files verified."
+
+      - name: "Validate Build Gate"
+        id: gate
+        run: echo "ready=true" >> $GITHUB_OUTPUT
+
+  security-audit:
+    name: "Security Audit"
+    needs: pre-flight
+    if: needs.pre-flight.outputs.build_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Code (Full History)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "Dependency Audit"
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter pub outdated || true
+
+      - name: "Install Semgrep"
+        run: pip install semgrep==1.180.0
+
+      - name: "SAST Scan"
+        run: |
+          set -euo pipefail
+          semgrep scan --config p/dart --error
+
+      - name: "Gitleaks Scan"
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  quality-gate:
+    name: "Quality Gate"
+    needs: security-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "Dependencies"
+        run: flutter pub get
+
+      - name: "Format Check"
+        run: |
+          set -euo pipefail
+          dart format --output=none --set-exit-if-changed lib/
+
+      - name: "Static Analysis"
+        run: |
+          set -euo pipefail
+          if [ "${{ env.STRICT_MODE }}" = "true" ]; then
+            flutter analyze --fatal-infos --fatal-warnings
+          else
+            flutter analyze --no-fatal-warnings
+          fi
+
+      - name: "Line Count Check"
+        run: |
+          set -euo pipefail
+          find lib/ -name "*.dart" -exec wc -l {} + | awk -v max=1000 '$1 > max && $2 != "total" {print "⚠️ " $0; found=1} END {exit found ? 1 : 0}'
+
+  test-suite:
+    name: "Test Suite"
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "Dependencies"
+        run: flutter pub get
+
+      - name: "Run Tests"
+        run: |
+          set -euo pipefail
+          if [ ! -d "test" ]; then exit 1; fi
+          TEST_COUNT=$(find test -name "*_test.dart" | wc -l)
+          if [ "$TEST_COUNT" -eq 0 ]; then exit 1; fi
+          flutter test --coverage
+
+      - name: "Coverage Gate"
+        run: |
+          set -euo pipefail
+          if [ -f "coverage/lcov.info" ]; then
+            TOTAL=$(awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END {if(lf>0) printf "%.1f", (lh/lf)*100; else print "0"}' coverage/lcov.info)
+            MIN=${{ env.COVERAGE_MIN_PCT }}
+            if (( $(echo "$TOTAL < $MIN" | bc -l) )); then exit 1; fi
+          else
+            exit 1
+          fi
+
+  build:
+    name: "Build (${{ matrix.arch }})"
+    needs: test-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64-v8a
+            target: android-arm64
+          - arch: armeabi-v7a
+            target: android-arm
+          - arch: x86_64
+            target: android-x64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools build-tools;34.0.0 platforms;android-34"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "Dependencies"
+        run: flutter pub get
+
+      - name: "Enforce Keystore"
+        if: env.VARIANT == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_BASE64" ]; then exit 1; fi
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=release.keystore
+          EOF
+          
+          if [ -f "android/app/build.gradle" ]; then
+            sed -i '1s/^/import java.util.Properties\n/; 1a\
+def keystoreProperties = new Properties()\
+def keystorePropertiesFile = rootProject.file("key.properties")\
+if (keystorePropertiesFile.exists()) {\
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\
+}\
+' android/app/build.gradle
+            sed -i '/android {/a\
+    signingConfigs {\
+        release {\
+            keyAlias keystoreProperties["keyAlias"]\
+            keyPassword keystoreProperties["keyPassword"]\
+            storeFile file(keystoreProperties["storeFile"])\
+            storePassword keystoreProperties["storePassword"]\
+        }\
+    }' android/app/build.gradle
+            sed -i '/buildTypes {/a\
+        release {\
+            signingConfig signingConfigs.release\
+        }' android/app/build.gradle
+          fi
+
+      - name: "Build APK"
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ "${{ env.VARIANT }}" = "release" ]; then
+            EXTRA_ARGS+=(--obfuscate)
+            EXTRA_ARGS+=("--split-debug-info=build/debug-info-${{ matrix.arch }}/")
+          fi
+          flutter build apk \
+            "--${{ env.VARIANT }}" \
+            --target-platform "${{ matrix.target }}" \
+            "${EXTRA_ARGS[@]}"
+
+      - name: "Verify and Rename"
+        run: |
+          set -euo pipefail
+          APK_DIR="build/app/outputs/flutter-apk"
+          APK_COUNT=$(find "$APK_DIR" -name "*.apk" | wc -l)
+          if [ "$APK_COUNT" -ne 1 ]; then exit 1; fi
+          ORIGINAL_APK=$(find "$APK_DIR" -name "*.apk" | head -n 1)
+          NEW_NAME="oneAnime-${{ matrix.arch }}-${{ env.VARIANT }}.apk"
+          mv "$ORIGINAL_APK" "$APK_DIR/$NEW_NAME"
+
+      - name: "Upload APK"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-apk
+          path: build/app/outputs/flutter-apk/oneAnime-${{ matrix.arch }}-*.apk
+          retention-days: 30
+
+      - name: "Upload Symbols"
+        if: env.VARIANT == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ matrix.arch }}
+          path: build/debug-info-${{ matrix.arch }}/
+          retention-days: 7
+
+  integrity:
+    name: "Integrity Check"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "build-tools;34.0.0"
+
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: '*-apk'
+          merge-multiple: true
+
+      - name: "Verify Architectures"
+        run: |
+          set -euo pipefail
+          APK_COUNT=$(find dist/ -name "*.apk" | wc -l)
+          if [ "$APK_COUNT" -ne 3 ]; then exit 1; fi
+          for arch in arm64-v8a armeabi-v7a x86_64; do
+            if ! ls dist/*-$arch-*.apk 1> /dev/null 2>&1; then exit 1; fi
+          done
+
+      - name: "Verify Signatures and Fingerprints"
+        env:
+          EXPECTED_FINGERPRINT: ${{ secrets.EXPECTED_CERT_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          for apk in dist/*.apk; do
+            CERTS=$($APKSIGNER verify --print-certs "$apk" 2>&1)
+            if [[ "$apk" == *"-release.apk" ]]; then
+              if [ -z "$EXPECTED_FINGERPRINT" ]; then exit 1; fi
+              ACTUAL_FP=$(echo "$CERTS" | grep -i "SHA-256" | awk -F': ' '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]' | xargs)
+              EXPECTED_FP=$(echo "$EXPECTED_FINGERPRINT" | tr -d ':' | tr '[:upper:]' '[:lower:]' | xargs)
+              if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then exit 1; fi
+            fi
+          done
+
+      - name: "Compute Checksums"
+        run: |
+          set -euo pipefail
+          cd dist/
+          sha256sum *.apk > SHA256SUMS.txt
+
+      - name: "Upload Checksums"
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS.txt
+          retention-days: 30
+
+  forge-report:
+    name: "Forge Report"
+    needs: [pre-flight, security-audit, quality-gate, test-suite, build, integrity]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Generate Summary"
+        run: |
+          set -euo pipefail
+          echo "## Forge Factory Report" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "❌ **FAILED**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ **PASSED**" >> $GITHUB_STEP_SUMMARY
+          fi
