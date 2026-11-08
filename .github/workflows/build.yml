@@ -1,0 +1,519 @@
+# ============================================================================
+#  oneAnime — The Forge Factory v7.2 (The Bulletproof Edition)
+# ============================================================================
+#  التطبيق الصارم لدستور الورشة:
+#  - إصلاح جذري لتوقيع Gradle (يمنع الـ Debug signing في Release).
+#  - الـ Pull Request يبني Debug تلقائياً.
+#  - تثبيت إصدار Flutter (3.24.3).
+#  - مقارنة بصمة الشهادة بدقة (Fail on Mismatch).
+#  - تحديث جميع Actions (Node 24 Ready).
+# ============================================================================
+
+name: Forge Factory (Bulletproof)
+
+on:
+  push:
+    branches: [ main, master, "release/**" ]
+    tags: [ "v*" ]
+    paths-ignore: [ "**.md", "docs/**", ".github/ISSUE_TEMPLATE/**" ]
+  pull_request:
+    branches: [ main, master ]
+    types: [ opened, synchronize, reopened ]
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "APK variant"
+        required: true
+        default: "release"
+        type: choice
+        options: [ debug, profile, release ]
+      strict_mode:
+        description: "Fail on warnings?"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: forge-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "17"
+  JAVA_DISTRIBUTION: "zulu"
+  FLUTTER_VERSION: "3.24.3"
+  COVERAGE_MIN_PCT: "50"
+  STRICT_MODE: ${{ github.event.inputs.strict_mode || 'true' }}
+  # لو Pull Request، يبقى Debug تلقائياً. غير كده، ياخد اختيارك أو release
+  VARIANT: ${{ github.event_name == 'pull_request' && 'debug' || github.event.inputs.build_variant || 'release' }}
+
+jobs:
+  # ==========================================================================
+  # JOB 1: Pre-Flight (الفحص المسبق)
+  # ==========================================================================
+  pre-flight:
+    name: "🔍 Pre-Flight Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build_ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: "1. Verify Essential Files"
+        run: |
+          set -euo pipefail
+          echo "::group::Essential Files Check"
+          for file in pubspec.yaml lib/main.dart; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing required file: $file"
+              exit 1
+            fi
+            echo "✓ Found $file"
+          done
+          echo "::endgroup::"
+
+      - name: "2. Validate Build Gate"
+        id: gate
+        run: echo "ready=true" >> $GITHUB_OUTPUT
+
+  # ==========================================================================
+  # JOB 2: Security & Dependency Audit (إجباري)
+  # ==========================================================================
+  security-audit:
+    name: "🛡️ Security & Audit"
+    needs: pre-flight
+    if: needs.pre-flight.outputs.build_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Code (Full History)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "1. Dependency Audit (Outdated Check)"
+        run: |
+          set -euo pipefail
+          flutter pub get
+          echo "::group::Outdated Packages"
+          flutter pub outdated
+          echo "::endgroup::"
+
+      - name: "2. Install Semgrep (Pinned)"
+        run: pip install semgrep==1.180.0
+
+      - name: "3. SAST - Semgrep Scan (Strict)"
+        run: |
+          set -euo pipefail
+          echo "::group::Semgrep Scan"
+          semgrep scan --config p/dart --error
+          echo "::endgroup::"
+
+      - name: "4. Gitleaks (Strict History Scan)"
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  # ==========================================================================
+  # JOB 3: Quality Gate (بوابة الجودة الصارمة)
+  # ==========================================================================
+  quality-gate:
+    name: "📐 Quality Gate"
+    needs: security-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: "1. Format Check"
+        run: |
+          set -euo pipefail
+          echo "::group::Dart Format"
+          dart format --output=none --set-exit-if-changed lib/
+          echo "::endgroup::"
+
+      - name: "2. Static Analysis (Strict vs Normal)"
+        run: |
+          set -euo pipefail
+          echo "::group::Flutter Analyze"
+          
+          if [ "${{ env.STRICT_MODE }}" = "true" ]; then
+            echo "Running in Strict Mode"
+            flutter analyze --fatal-infos --fatal-warnings
+          else
+            echo "Running in Normal Mode"
+            flutter analyze --no-fatal-warnings
+          fi
+          
+          echo "::endgroup::"
+
+      - name: "3. Line Count Check"
+        run: |
+          set -euo pipefail
+          MAX_LINES=1000
+          echo "::group::Line Count Check"
+          find lib/ -name "*.dart" -exec wc -l {} + | awk -v max=$MAX_LINES '$1 > max && $2 != "total" {print "⚠️ " $0; found=1} END {exit found ? 1 : 0}'
+          echo "::endgroup::"
+
+  # ==========================================================================
+  # JOB 4: Test Suite (الاختبارات إجبارية)
+  # ==========================================================================
+  test-suite:
+    name: "🧪 Test Suite"
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: "1. Run Tests (Strict)"
+        run: |
+          set -euo pipefail
+          echo "::group::Running Tests"
+          
+          if [ ! -d "test" ]; then
+            echo "::error::No 'test' directory found."
+            exit 1
+          fi
+          
+          TEST_COUNT=$(find test -name "*_test.dart" | wc -l)
+          if [ "$TEST_COUNT" -eq 0 ]; then
+             echo "::error::No test files (*_test.dart) found."
+             exit 1
+          fi
+
+          flutter test --coverage
+          echo "::endgroup::"
+
+      - name: "2. Coverage Gate (Strict)"
+        run: |
+          set -euo pipefail
+          echo "::group::Coverage Check"
+          if [ -f "coverage/lcov.info" ]; then
+            TOTAL=$(awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END {if(lf>0) printf "%.1f", (lh/lf)*100; else print "0"}' coverage/lcov.info)
+            echo "Coverage: $TOTAL%"
+            MIN=${{ env.COVERAGE_MIN_PCT }}
+            if (( $(echo "$TOTAL < $MIN" | bc -l) )); then
+              echo "::error::Coverage $TOTAL% below $MIN% threshold"
+              exit 1
+            fi
+          else
+            echo "::error::No coverage file generated."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+  # ==========================================================================
+  # JOB 5: Build Matrix (بناء متوازي مع توقيع إجباري)
+  # ==========================================================================
+  build:
+    name: "🏗️ Build (${{ matrix.arch }})"
+    needs: test-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64-v8a
+            target: android-arm64
+          - arch: armeabi-v7a
+            target: android-arm
+          - arch: x86_64
+            target: android-x64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools build-tools;34.0.0 platforms;android-34"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: "1. Enforce Keystore for Release & Patch Gradle"
+        if: env.VARIANT == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Release build requires KEYSTORE_BASE64 secret!"
+            exit 1
+          fi
+
+          # إعداد الـ Keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+          
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=release.keystore
+          EOF
+
+          # تعديل build.gradle لقراءة المفتاح (Groovy)
+          if [ -f "android/app/build.gradle" ]; then
+            # إضافة استيراد Properties وإعداد الـ keystoreProperties
+            sed -i '1s/^/import java.util.Properties\n/; 1a\
+def keystoreProperties = new Properties()\
+def keystorePropertiesFile = rootProject.file("key.properties")\
+if (keystorePropertiesFile.exists()) {\
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\
+}\
+' android/app/build.gradle
+            
+            # تعديل الـ signingConfigs
+            sed -i '/android {/a\
+    signingConfigs {\
+        release {\
+            keyAlias keystoreProperties["keyAlias"]\
+            keyPassword keystoreProperties["keyPassword"]\
+            storeFile file(keystoreProperties["storeFile"])\
+            storePassword keystoreProperties["storePassword"]\
+        }\
+    }' android/app/build.gradle
+
+            # تعديل الـ buildTypes
+            sed -i '/buildTypes {/a\
+        release {\
+            signingConfig signingConfigs.release\
+        }' android/app/build.gradle
+            
+            echo "✓ build.gradle patched successfully for release signing."
+          else
+            echo "::error::android/app/build.gradle not found! Cannot enforce signing."
+            exit 1
+          fi
+
+      - name: "2. Build APK — ${{ matrix.arch }}"
+        run: |
+          set -euo pipefail
+          echo "::group::Building APK for ${{ matrix.arch }} (${{ env.VARIANT }})"
+          
+          EXTRA_ARGS=()
+          if [ "${{ env.VARIANT }}" = "release" ]; then
+            EXTRA_ARGS+=(--obfuscate)
+            EXTRA_ARGS+=("--split-debug-info=build/debug-info-${{ matrix.arch }}/")
+          fi
+
+          flutter build apk \
+            "--${{ env.VARIANT }}" \
+            --target-platform "${{ matrix.target }}" \
+            "${EXTRA_ARGS[@]}"
+          echo "::endgroup::"
+
+      - name: "3. Verify and Rename APK"
+        run: |
+          set -euo pipefail
+          APK_DIR="build/app/outputs/flutter-apk"
+          APK_COUNT=$(find "$APK_DIR" -name "*.apk" | wc -l)
+          
+          if [ "$APK_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly 1 APK, but found $APK_COUNT"
+            exit 1
+          fi
+
+          ORIGINAL_APK=$(find "$APK_DIR" -name "*.apk" | head -n 1)
+          NEW_NAME="oneAnime-${{ matrix.arch }}-${{ env.VARIANT }}.apk"
+          mv "$ORIGINAL_APK" "$APK_DIR/$NEW_NAME"
+          echo "✓ Renamed APK to $NEW_NAME"
+
+      - name: "4. Upload APK"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-apk
+          path: build/app/outputs/flutter-apk/oneAnime-${{ matrix.arch }}-*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: "5. Upload Debug Symbols (Release Only)"
+        if: env.VARIANT == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ matrix.arch }}
+          path: build/debug-info-${{ matrix.arch }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ==========================================================================
+  # JOB 6: Integrity & Checksums (سلسلة الثقة)
+  # ==========================================================================
+  integrity:
+    name: "🔐 Integrity Check"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "build-tools;34.0.0"
+
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: '*-apk'
+          merge-multiple: true
+
+      - name: "1. Verify Exactly 3 Architectures"
+        run: |
+          set -euo pipefail
+          APK_COUNT=$(find dist/ -name "*.apk" | wc -l)
+          if [ "$APK_COUNT" -ne 3 ]; then
+            echo "::error::Expected exactly 3 APKs, found $APK_COUNT"
+            exit 1
+          fi
+          for arch in arm64-v8a armeabi-v7a x86_64; do
+            if ! ls dist/*-$arch-*.apk 1> /dev/null 2>&1; then
+              echo "::error::Missing APK for architecture: $arch"
+              exit 1
+            fi
+          done
+          echo "✓ Found all 3 architecture APKs"
+
+      - name: "2. Verify Signatures and Fingerprints (Strict)"
+        env:
+          EXPECTED_FINGERPRINT: ${{ secrets.EXPECTED_CERT_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          echo "::group::APK Signatures"
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          
+          for apk in dist/*.apk; do
+            echo "--- $apk ---"
+            CERTS=$($APKSIGNER verify --print-certs "$apk" 2>&1)
+            echo "$CERTS"
+            
+            # لو إحنا في release، البصمة إجبارية
+            if [[ "$apk" == *"-release.apk" ]]; then
+              if [ -z "$EXPECTED_FINGERPRINT" ]; then
+                echo "::error::Release APK requires EXPECTED_CERT_FINGERPRINT secret!"
+                exit 1
+              fi
+              
+              # استخراج البصمة وتنظيفها للمقارنة الدقيقة
+              ACTUAL_FP=$(echo "$CERTS" | grep -i "SHA-256" | awk -F': ' '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]' | xargs)
+              EXPECTED_FP=$(echo "$EXPECTED_FINGERPRINT" | tr -d ':' | tr '[:upper:]' '[:lower:]' | xargs)
+              
+              if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then
+                echo "::error::Certificate fingerprint mismatch!"
+                echo "Expected: $EXPECTED_FP"
+                echo "Actual:   $ACTUAL_FP"
+                exit 1
+              fi
+              echo "✓ Fingerprint matched for $apk"
+            fi
+          done
+          echo "::endgroup::"
+
+      - name: "3. Compute Checksums"
+        run: |
+          set -euo pipefail
+          echo "::group::SHA-256"
+          cd dist/
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "::endgroup::"
+
+      - name: "4. Upload Checksums"
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS.txt
+          retention-days: 30
+
+  # ==========================================================================
+  # JOB 7: Forge Report (التقرير النهائي)
+  # ==========================================================================
+  forge-report:
+    name: "📊 Forge Report"
+    needs: [pre-flight, security-audit, quality-gate, test-suite, build, integrity]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Generate Summary"
+        run: |
+          set -euo pipefail
+          echo "# 🏗️ Forge Factory Report (Bulletproof)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🛠️ Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-Flight | ${{ needs.pre-flight.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Audit | ${{ needs.security-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Quality Gate | ${{ needs.quality-gate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | ${{ needs.test-suite.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integrity | ${{ needs.integrity.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏁 Final Verdict" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "❌ **FAILED** — One or more jobs failed, were cancelled, or skipped." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ **PASSED** — All strict gates cleared." >> $GITHUB_STEP_SUMMARY
+          fi
